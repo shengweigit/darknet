@@ -257,6 +257,10 @@ convolutional_layer make_convolutional_layer(int batch, int h, int w, int c, int
         l.bias_v = calloc(n, sizeof(float));
         l.scale_v = calloc(n, sizeof(float));
     }
+    if (!l.fmin_max) {
+    	l.fmin_max = calloc(2, sizeof(fmin_max_t));
+    }
+
 
 #ifdef GPU
     l.forward_gpu = forward_convolutional_layer_gpu;
@@ -442,6 +446,18 @@ void backward_bias(float *bias_updates, float *delta, int batch, int n, int size
     }
 }
 
+void update_fmin_max(fmin_max_t *fmin_max, float fmin, float fmax)
+{
+	if(fmin < fmin_max->min) {
+		//fprintf(stderr, "update fmin %.6f-->%.6f\n", fmin_max->min, fmin);
+		fmin_max->min = fmin;
+	}
+	if(fmax > fmin_max->max) {
+		//fprintf(stderr, "update fmax %.6f-->%.6f\n", fmin_max->max, fmax);
+		fmin_max->max = fmax;
+	}
+}
+
 void forward_convolutional_layer(convolutional_layer l, network net)
 {
     int i, j;
@@ -482,6 +498,23 @@ void forward_convolutional_layer(convolutional_layer l, network net)
 
     activate_array(l.output, l.outputs*l.batch, l.activation);
     if(l.binary || l.xnor) swap_binary(&l);
+    if(net.rmode == RMODE_QUANT_STATISTIC) {
+    	float fmin, fmax;
+    	tensor_min_max(l.weights, l.size, l.size, l.c, l.n, &fmin, &fmax);
+    	update_fmin_max(&l.fmin_max[0], fmin, fmax);
+    	fprintf(stderr, "[weight]min: %.6f, max: %.6f\n", fmin, fmax);
+
+    	tensor_min_max(l.output, l.batch, l.out_h, l.out_w, l.out_c, &fmin, &fmax);
+    	update_fmin_max(&l.fmin_max[1], fmin, fmax);
+    	fprintf(stderr, "[activation]min: %.6f, max: %.6f\n", fmin, fmax);
+     }
+    if(net.rmode == RMODE_FAKE_QUANT) {
+    	int total;
+    	total = l.batch * l.out_h * l.out_w * l.out_c;
+    	fake_quant_with_min_max(l.output, total, l.fmin_max[1].min, l.fmin_max[1].max,
+    			8, l.output);
+    }
+
 }
 
 void backward_convolutional_layer(convolutional_layer l, network net)

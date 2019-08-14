@@ -112,6 +112,11 @@ typedef struct network network;
 struct layer;
 typedef struct layer layer;
 
+typedef struct{
+	float min;
+	float max;
+} fmin_max_t;
+
 struct layer{
     LAYER_TYPE type;
     ACTIVATION activation;
@@ -331,6 +336,10 @@ struct layer{
 
     size_t workspace_size;
 
+    fmin_max_t *fmin_max;
+    int quant_num_bits_weight;
+    int quant_num_bits_activation;
+
 #ifdef GPU
     int *indexes_gpu;
 
@@ -427,6 +436,10 @@ typedef enum {
     CONSTANT, STEP, EXP, POLY, STEPS, SIG, RANDOM
 } learning_rate_policy;
 
+typedef enum {
+	RMODE_NORMAL, RMODE_QUANT_STATISTIC, RMODE_FAKE_QUANT
+} running_mode;
+
 typedef struct network{
     int n;
     int batch;
@@ -485,7 +498,8 @@ typedef struct network{
     int index;
     float *cost;
     float clip;
-
+    running_mode rmode;
+    int load_with_min_max;
 #ifdef GPU
     float *input_gpu;
     float *truth_gpu;

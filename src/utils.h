@@ -48,6 +48,8 @@ float **one_hot_encode(float *a, int n, int k);
 float sec(clock_t clocks);
 void print_statistics(float *a, int n);
 int int_index(int *a, int val, int n);
+void tensor_min_max(float *a, int d0, int d1, int d2, int d3, float *min, float *max);
+void fake_quant_with_min_max(float *input, int total, float real_min, float real_max, int num_bits, float *output);
 
 #endif
 

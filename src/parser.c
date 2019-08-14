@@ -652,6 +652,20 @@ learning_rate_policy get_policy(char *s)
     return CONSTANT;
 }
 
+running_mode get_running_mode(char *s)
+{
+	if (strcmp(s, "normal") == 0) return RMODE_NORMAL;
+	if (strcmp(s, "quant_statistic") == 0) return RMODE_QUANT_STATISTIC;
+	if (strcmp(s, "fake_quant") == 0) return RMODE_FAKE_QUANT;
+	return RMODE_NORMAL;
+}
+
+int load_with_min_max(char *s)
+{
+	if (strcmp(s, "true") == 0 || (strcmp(s, "True") == 0)) return 1;
+	return 0;
+}
+
 void parse_net_options(list *options, network *net)
 {
     net->batch = option_find_int(options, "batch",1);
@@ -731,6 +745,19 @@ void parse_net_options(list *options, network *net)
     } else if (net->policy == POLY || net->policy == RANDOM){
     }
     net->max_batches = option_find_int(options, "max_batches", 0);
+    char *rmode_s = option_find_str(options, "running_mode", "Normal");
+    net->rmode = get_running_mode(rmode_s);
+    if (net->rmode == RMODE_NORMAL) {
+    	printf("running mode: normal\n");
+    }
+    if (net->rmode == RMODE_QUANT_STATISTIC) {
+    	printf("running mode: quantization statistic\n");
+    }
+    if (net->rmode == RMODE_FAKE_QUANT) {
+    	printf("running mode: fake quantization\n");
+    }
+    char *load_s = option_find_str(options, "with_min_max", "false");
+    net->load_with_min_max = load_with_min_max(load_s);
 }
 
 int is_network(section *s)
@@ -974,6 +1001,7 @@ void save_convolutional_weights(layer l, FILE *fp)
         fwrite(l.rolling_variance, sizeof(float), l.n, fp);
     }
     fwrite(l.weights, sizeof(float), num, fp);
+    fwrite(&l.fmin_max[0], sizeof(fmin_max_t), 2, fp);
 }
 
 void save_batchnorm_weights(layer l, FILE *fp)
@@ -1161,7 +1189,7 @@ void load_convolutional_weights_binary(layer l, FILE *fp)
 #endif
 }
 
-void load_convolutional_weights(layer l, FILE *fp)
+void load_convolutional_weights(network *net, layer l, FILE *fp)
 {
     if(l.binary){
         //load_convolutional_weights_binary(l, fp);
@@ -1202,6 +1230,18 @@ void load_convolutional_weights(layer l, FILE *fp)
         }
     }
     fread(l.weights, sizeof(float), num, fp);
+    if (net->load_with_min_max) {
+		fread(l.fmin_max, sizeof(fmin_max_t), 2, fp);
+		fprintf(stderr, "[load weight    ] min: %.6f, max: %.6f\n", l.fmin_max[0].min, l.fmin_max[0].max);
+		fprintf(stderr, "[load activation] min: %.6f, max: %.6f\n", l.fmin_max[1].min, l.fmin_max[1].max);
+    }
+    // quantize weight in load weight stage due to weights need quantize only once.
+    if(net->rmode == RMODE_FAKE_QUANT) {
+    	int total;
+    	total = l.size * l.size * l.c * l.n;
+    	fake_quant_with_min_max(l.weights, total, l.fmin_max[0].min, l.fmin_max[0].max,
+    			8, l.weights);
+    }
     //if(l.c == 3) scal_cpu(num, 1./256, l.weights, 1);
     if (l.flipped) {
         transpose_matrix(l.weights, l.c*l.size*l.size, l.n);
@@ -1247,7 +1287,7 @@ void load_weights_upto(network *net, char *filename, int start, int cutoff)
         layer l = net->layers[i];
         if (l.dontload) continue;
         if(l.type == CONVOLUTIONAL || l.type == DECONVOLUTIONAL){
-            load_convolutional_weights(l, fp);
+            load_convolutional_weights(net, l, fp);
         }
         if(l.type == CONNECTED){
             load_connected_weights(l, fp, transpose);
@@ -1256,9 +1296,9 @@ void load_weights_upto(network *net, char *filename, int start, int cutoff)
             load_batchnorm_weights(l, fp);
         }
         if(l.type == CRNN){
-            load_convolutional_weights(*(l.input_layer), fp);
-            load_convolutional_weights(*(l.self_layer), fp);
-            load_convolutional_weights(*(l.output_layer), fp);
+            load_convolutional_weights(net, *(l.input_layer), fp);
+            load_convolutional_weights(net, *(l.self_layer), fp);
+            load_convolutional_weights(net, *(l.output_layer), fp);
         }
         if(l.type == RNN){
             load_connected_weights(*(l.input_layer), fp, transpose);
