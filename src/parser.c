@@ -13,6 +13,7 @@
 #include "connected_layer.h"
 #include "deconvolutional_layer.h"
 #include "convolutional_layer.h"
+#include "quant_convolutional_layer.h"
 #include "cost_layer.h"
 #include "crnn_layer.h"
 #include "crop_layer.h"
@@ -36,6 +37,7 @@
 #include "softmax_layer.h"
 #include "lstm_layer.h"
 #include "utils.h"
+#include "quant.h"
 
 typedef struct{
     char *type;
@@ -57,6 +59,7 @@ LAYER_TYPE string_to_layer_type(char * type)
     if (strcmp(type, "[local]")==0) return LOCAL;
     if (strcmp(type, "[conv]")==0
             || strcmp(type, "[convolutional]")==0) return CONVOLUTIONAL;
+    if (strcmp(type, "[quant_convolutional]")==0) return QUANT_CONVOLUTIONAL;
     if (strcmp(type, "[deconv]")==0
             || strcmp(type, "[deconvolutional]")==0) return DECONVOLUTIONAL;
     if (strcmp(type, "[activation]")==0) return ACTIVE;
@@ -200,6 +203,36 @@ convolutional_layer parse_convolutional(list *options, size_params params)
     int xnor = option_find_int_quiet(options, "xnor", 0);
 
     convolutional_layer layer = make_convolutional_layer(batch,h,w,c,n,groups,size,stride,padding,activation, batch_normalize, binary, xnor, params.net->adam);
+    layer.flipped = option_find_int_quiet(options, "flipped", 0);
+    layer.dot = option_find_float_quiet(options, "dot", 0);
+
+    return layer;
+}
+
+quant_convolutional_layer parse_quant_convolutional(list *options, size_params params)
+{
+    int n = option_find_int(options, "filters",1);
+    int size = option_find_int(options, "size",1);
+    int stride = option_find_int(options, "stride",1);
+    int pad = option_find_int_quiet(options, "pad",0);
+    int padding = option_find_int_quiet(options, "padding",0);
+    int groups = option_find_int_quiet(options, "groups", 1);
+    if(pad) padding = size/2;
+
+    char *activation_s = option_find_str(options, "activation", "logistic");
+    ACTIVATION activation = get_activation(activation_s);
+
+    int batch,h,w,c;
+    h = params.h;
+    w = params.w;
+    c = params.c;
+    batch=params.batch;
+    if(!(h && w && c)) error("Layer before convolutional layer must output image.");
+    int batch_normalize = option_find_int_quiet(options, "batch_normalize", 0);
+    int binary = option_find_int_quiet(options, "binary", 0);
+    int xnor = option_find_int_quiet(options, "xnor", 0);
+
+    quant_convolutional_layer layer = make_quant_convolutional_layer(batch,h,w,c,n,groups,size,stride,padding,activation, batch_normalize, binary, xnor, params.net->adam);
     layer.flipped = option_find_int_quiet(options, "flipped", 0);
     layer.dot = option_find_float_quiet(options, "dot", 0);
 
@@ -660,7 +693,8 @@ running_mode get_running_mode(char *s)
 	return RMODE_NORMAL;
 }
 
-int load_with_min_max(char *s)
+
+int load_bool_val(char *s)
 {
 	if (strcmp(s, "true") == 0 || (strcmp(s, "True") == 0)) return 1;
 	return 0;
@@ -757,7 +791,13 @@ void parse_net_options(list *options, network *net)
     	printf("running mode: fake quantization\n");
     }
     char *load_s = option_find_str(options, "with_min_max", "false");
-    net->load_with_min_max = load_with_min_max(load_s);
+    net->load_with_min_max = load_bool_val(load_s);
+
+    char *load_bn = option_find_str(options, "fold_batchnorm", "false");
+    net->fold_batchnorm = load_bool_val(load_bn);
+    if (net->fold_batchnorm) {
+    	printf("fold batchnorm: true\n");
+    }
 }
 
 int is_network(section *s)
@@ -802,6 +842,8 @@ network *parse_network_cfg(char *filename)
         LAYER_TYPE lt = string_to_layer_type(s->type);
         if(lt == CONVOLUTIONAL){
             l = parse_convolutional(options, params);
+        }else if(lt == QUANT_CONVOLUTIONAL){
+            l = parse_quant_convolutional(options, params);
         }else if(lt == DECONVOLUTIONAL){
             l = parse_deconvolutional(options, params);
         }else if(lt == LOCAL){
@@ -1001,7 +1043,7 @@ void save_convolutional_weights(layer l, FILE *fp)
         fwrite(l.rolling_variance, sizeof(float), l.n, fp);
     }
     fwrite(l.weights, sizeof(float), num, fp);
-    fwrite(&l.fmin_max[0], sizeof(fmin_max_t), 2, fp);
+    fwrite(&l.fmin_max[0], sizeof(fmin_max_t), 3, fp);
 }
 
 void save_batchnorm_weights(layer l, FILE *fp)
@@ -1235,13 +1277,80 @@ void load_convolutional_weights(network *net, layer l, FILE *fp)
 		fprintf(stderr, "[load weight    ] min: %.6f, max: %.6f\n", l.fmin_max[0].min, l.fmin_max[0].max);
 		fprintf(stderr, "[load activation] min: %.6f, max: %.6f\n", l.fmin_max[1].min, l.fmin_max[1].max);
     }
-    // quantize weight in load weight stage due to weights need quantize only once.
-    if(net->rmode == RMODE_FAKE_QUANT) {
-    	int total;
-    	total = l.size * l.size * l.c * l.n;
-    	fake_quant_with_min_max(l.weights, total, l.fmin_max[0].min, l.fmin_max[0].max,
-    			8, l.weights);
+    //if(l.c == 3) scal_cpu(num, 1./256, l.weights, 1);
+    if (l.flipped) {
+        transpose_matrix(l.weights, l.c*l.size*l.size, l.n);
     }
+    //if (l.binary) binarize_weights(l.weights, l.n, l.c*l.size*l.size, l.weights);
+    if (net->fold_batchnorm && l.batch_normalize) {
+    	float *betas = calloc(l.n, sizeof(float));
+    	memcpy(betas, l.biases, l.n * sizeof(float));
+    	fold_batchnorm(l.weights, l.n, l.c, l.size, l.rolling_mean, l.rolling_variance, l.scales, betas, l.weights, l.biases);
+    	free(betas);
+    }
+#ifdef GPU
+    if(gpu_index >= 0){
+        push_convolutional_layer(l);
+    }
+#endif
+}
+
+void load_quant_convolutional_weights(network *net, layer l, FILE *fp)
+{
+    if(l.binary){
+        //load_convolutional_weights_binary(l, fp);
+        //return;
+    }
+    if(l.numload) l.n = l.numload;
+    int num = l.c/l.groups*l.n*l.size*l.size;
+    fread(l.biases, sizeof(float), l.n, fp);
+    if (l.batch_normalize && (!l.dontloadscales)){
+        fread(l.scales, sizeof(float), l.n, fp);
+        fread(l.rolling_mean, sizeof(float), l.n, fp);
+        fread(l.rolling_variance, sizeof(float), l.n, fp);
+        if(0){
+            int i;
+            for(i = 0; i < l.n; ++i){
+                printf("%g, ", l.rolling_mean[i]);
+            }
+            printf("\n");
+            for(i = 0; i < l.n; ++i){
+                printf("%g, ", l.rolling_variance[i]);
+            }
+            printf("\n");
+        }
+        if(0){
+            fill_cpu(l.n, 0, l.rolling_mean, 1);
+            fill_cpu(l.n, 0, l.rolling_variance, 1);
+        }
+        if(0){
+            int i;
+            for(i = 0; i < l.n; ++i){
+                printf("%g, ", l.rolling_mean[i]);
+            }
+            printf("\n");
+            for(i = 0; i < l.n; ++i){
+                printf("%g, ", l.rolling_variance[i]);
+            }
+            printf("\n");
+        }
+    }
+    fread(l.weights, sizeof(float), num, fp);
+    if (net->load_with_min_max) {
+		fread(&l.fmin_max[0], sizeof(fmin_max_t), 1, fp);
+		fread(&l.fmin_max[1], sizeof(fmin_max_t), 1, fp);
+		fread(l.output_fmin_max, sizeof(fmin_max_t), 1, fp);
+		fprintf(stderr, "[load weight     ] min: %.6f, max: %.6f\n", l.fmin_max[0].min, l.fmin_max[0].max);
+		fprintf(stderr, "[load convolution] min: %.6f, max: %.6f\n", l.fmin_max[1].min, l.fmin_max[1].max);
+		fprintf(stderr, "[load activation ] min: %.6f, max: %.6f\n", l.output_fmin_max[0].min, l.output_fmin_max[0].max);
+    }
+    // quantize weight in load weight stage due to weights need quantize only once.
+	choose_quant_param(l.fmin_max[0].min, l.fmin_max[0].max, 8, &l.quant_param[0].scale, &l.quant_param[0].zero_point);
+	choose_quant_param(l.fmin_max[1].min, l.fmin_max[1].max, 8, &l.quant_param[1].scale, &l.quant_param[1].zero_point);
+	choose_quant_param(l.output_fmin_max[0].min, l.output_fmin_max[0].max, 8,
+			&l.output_quant_param[0].scale, &l.output_quant_param[0].zero_point);
+	quantize_uint8(l.weights, l.size * l.size * l.c * l.n, l.quant_param[0].scale, l.quant_param[0].zero_point, l.quant_weight);
+
     //if(l.c == 3) scal_cpu(num, 1./256, l.weights, 1);
     if (l.flipped) {
         transpose_matrix(l.weights, l.c*l.size*l.size, l.n);
@@ -1253,7 +1362,6 @@ void load_convolutional_weights(network *net, layer l, FILE *fp)
     }
 #endif
 }
-
 
 void load_weights_upto(network *net, char *filename, int start, int cutoff)
 {
@@ -1288,6 +1396,9 @@ void load_weights_upto(network *net, char *filename, int start, int cutoff)
         if (l.dontload) continue;
         if(l.type == CONVOLUTIONAL || l.type == DECONVOLUTIONAL){
             load_convolutional_weights(net, l, fp);
+        }
+        if(l.type == QUANT_CONVOLUTIONAL){
+            load_quant_convolutional_weights(net, l, fp);
         }
         if(l.type == CONNECTED){
             load_connected_weights(l, fp, transpose);

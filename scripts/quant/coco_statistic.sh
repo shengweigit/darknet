@@ -1,1 +1,1 @@
-./darknet coco statistic cfg/quant/yolov3_statistic.cfg yolov3.weights output/yolov3_statistic.weights
+./darknet coco statistic cfg/quant/yolov3_tiny_statistic.cfg yolov3_tiny.weights output/yolov3_tiny_statistic.weights

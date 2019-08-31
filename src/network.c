@@ -203,6 +203,8 @@ void forward_network(network *netp)
         }
         l.forward(l, net);
         net.input = l.output;
+        net.input_fmin_max = l.output_fmin_max;
+        net.input_quant_param = l.output_quant_param;
         if(l.truth) {
             net.truth = l.output;
         }
